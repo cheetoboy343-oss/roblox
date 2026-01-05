@@ -38,18 +38,6 @@ end
 ForceMetersMax()
 print("[Skill Builder] Domain meter set to 100%, Focus & Tokens set to max (3)")
 
--- Automatically delete Emotes GUI forever
-local function RemoveEmotes()
-    local emotes = LocalPlayer.PlayerGui:FindFirstChild("Emotes")
-    if emotes then emotes:Destroy() end
-end
-RemoveEmotes()
-LocalPlayer.PlayerGui.ChildAdded:Connect(function(child)
-    if child.Name == "Emotes" then
-        task.wait()
-        child:Destroy()
-    end
-end)
 
 -- Keep everything at max permanently
 RunService.Heartbeat:Connect(function()
