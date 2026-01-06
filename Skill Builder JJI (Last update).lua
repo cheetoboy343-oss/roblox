@@ -56,9 +56,36 @@ RunService.Heartbeat:Connect(function()
 end)
 -- ============================================
 
+
 -- Config Storage (using executor's filesystem if available)
 local SavedConfigs = {}
 local AutoloadConfigName = nil
+local AutoChantEnabled = false
+
+-- Double Chant Hook Logic
+local function HookRemote()
+    local Remote = ReplicatedStorage:WaitForChild("Remotes", 5):WaitForChild("Server", 5):WaitForChild("Combat", 5):WaitForChild("ApplyChantToNextHitbox", 5)
+    if Remote then
+        local oldFireServer
+        oldFireServer = hookfunction(Remote.FireServer, function(self, ...)
+            local args = {...}
+            local result = oldFireServer(self, unpack(args))
+            
+            -- If enabled and NOT fired by our own script hook (to avoid infinite loop)
+            if AutoChantEnabled and not checkcaller() then
+                task.spawn(function()
+                    oldFireServer(self, 3, true)
+                end)
+            end
+            
+            return result
+        end)
+    end
+end
+
+task.spawn(function()
+    pcall(HookRemote)
+end)
 
 -- Cyber Theme Colors
 local Colors = {
@@ -75,6 +102,10 @@ local Colors = {
     DropdownBg = Color3.fromRGB(25, 25, 35),
     ButtonHover = Color3.fromRGB(0, 200, 255),
 }
+
+-- Forward Declaration of Cooldown Overlays (for HandleSkillInput access)
+local CooldownOverlayPos = UDim2.new(0.8, 0, 0.7, 0)
+local InnatesOverlay, SkillsOverlay
 
 -- Key bindings to manage
 local KeyBinds = {"Z", "X", "C", "V", "B", "G", "T", "Y"}
@@ -93,6 +124,95 @@ local FuseSkillBindings = {} -- {key = {skill1, skill2, skill3, skill4}}
 
 -- Dropdown states
 local OpenDropdown = nil
+
+-- Key Hold Tracking (Only used for B intercept/Remote tabs if needed)
+local KeysHeld = {}
+
+-- Smart Combo Logic
+local function GetPerformingMoveValue()
+    local objects = workspace:FindFirstChild("Objects")
+    if objects then
+        local characters = objects:FindFirstChild("Characters")
+        if characters then
+            -- Find character model (either by name or just first child if name changes?? usually Name)
+            local char = characters:FindFirstChild(LocalPlayer.Name)
+            -- Sometimes the character name might be different in specific modes? Default to LocalPlayer.Name
+            
+            if char then
+                 -- Path: .Humanoid.CombatAgent.PerformingMove
+                 local humanoid = char:FindFirstChild("Humanoid")
+                 if humanoid then
+                     local combatAgent = humanoid:FindFirstChild("CombatAgent")
+                     if combatAgent then
+                         return combatAgent:FindFirstChild("PerformingMove")
+                     end
+                 end
+            end
+        end
+    end
+    return nil
+end
+
+local isComboRunning = false
+local function ExecuteSmartCombo(key, skills)
+    if isComboRunning then return end
+    isComboRunning = true
+    
+    task.spawn(function()
+        for i, skillName in ipairs(skills) do
+            -- Stop if key is released
+            if not KeysHeld[key] then break end
+            
+            -- Fire the skill
+            FireSkillRemote(skillName)
+            
+            -- If this is the last skill, no need to wait for completion (unless we want to block new combos?)
+            if i == #skills then
+                break
+            end
+            
+            -- Smart Wait Logic
+            local performingMove = GetPerformingMoveValue()
+            
+            if performingMove then
+                -- State 1: Wait for move to START (PerformingMove -> true)
+                -- Timeout 1.5s in case it failed to fire or is instant
+                local startTime = os.clock()
+                while not performingMove.Value and (os.clock() - startTime < 1.5) do
+                    if not KeysHeld[key] then break end -- Stop waiting if released
+                    task.wait()
+                end
+                
+                -- Check again before waiting for end
+                if not KeysHeld[key] then break end
+                
+                -- State 2: Wait for move to END (PerformingMove -> false)
+                -- Timeout 5s safety
+                local endTime = os.clock()
+                while performingMove.Value and (os.clock() - endTime < 5) do
+                    if not KeysHeld[key] then break end -- Stop waiting if released
+                    -- Re-check existence just in case character died/despawned
+                    if not performingMove or not performingMove.Parent then break end
+                    task.wait()
+                end
+            else
+                -- Fallback if value not found: simple wait
+                local waitStart = os.clock()
+                while (os.clock() - waitStart < 0.5) do
+                    if not KeysHeld[key] then break end
+                    task.wait()
+                end
+            end
+            
+            -- Check before next iteration
+            if not KeysHeld[key] then break end
+            
+            -- Tiny buffer before next
+            task.wait() 
+        end
+        isComboRunning = false
+    end)
+end
 
 -- Utility Functions
 local function CreateInstance(className, properties)
@@ -962,6 +1082,54 @@ local function FireSkillRemote(skillName)
     end
 end
 
+-- Global references for the CAS interceptor
+_G.IsHoldingInnatesTool = IsHoldingInnatesTool
+_G.IsHoldingSkillsTool = IsHoldingSkillsTool
+
+-- Main Skill Input Handler
+local function HandleSkillInput(key)
+    -- Check if holding Innates tool and has skill binding
+    if IsHoldingInnatesTool() then
+        -- Check Fuse Binding first (override)
+        if FuseInnateBindings[key] then
+            -- Smart Combo Execution
+            ExecuteSmartCombo(key, FuseInnateBindings[key])
+            
+            -- Trigger Cooldown on Overlay (Total max cooldown of the set)
+            local maxCD = GetSkillMaxCooldown(FuseInnateBindings[key])
+            if maxCD > 0 then
+                InnatesOverlay.TriggerCooldown(key, maxCD)
+            end
+            
+            return true
+        elseif RemoteInnateBindings[key] then
+            FireSkillRemote(RemoteInnateBindings[key])
+            return true
+        end
+    end
+    
+    -- Check if holding Skills tool and has skill binding
+    if IsHoldingSkillsTool() then
+        if FuseSkillBindings[key] then
+             -- Smart Combo Execution
+             ExecuteSmartCombo(key, FuseSkillBindings[key])
+             
+             -- Trigger Cooldown
+            local maxCD = GetSkillMaxCooldown(FuseSkillBindings[key])
+            if maxCD > 0 then
+                SkillsOverlay.TriggerCooldown(key, maxCD)
+            end
+            
+            return true
+        elseif RemoteSkillBindings[key] then
+            FireSkillRemote(RemoteSkillBindings[key])
+            return true
+        end
+    end
+    return false
+end
+_G.HandleSkillInput = HandleSkillInput
+
 -- Create Remote Key Row Function
 local function CreateRemoteKeyRow(parent, key, bindingStorage)
     local rowFrame = CreateInstance("Frame", {
@@ -1417,9 +1585,9 @@ SkillsFuseTab.CanvasSize = UDim2.new(0, 0, 0, #KeyBinds * 108 + 20)
 -- COOLDOWN OVERLAY SYSTEM
 -- ============================================
 
-local CooldownOverlayPos = UDim2.new(0.8, 0, 0.7, 0) -- Shared position
-local InnatesOverlay = nil
-local SkillsOverlay = nil
+-- CooldownOverlayPos Already declared at top
+-- local CooldownOverlayPos = UDim2.new(0.8, 0, 0.7, 0) 
+-- InnatesOverlay, SkillsOverlay Already declared at top
 
 local TextService = game:GetService("TextService")
 
@@ -1432,7 +1600,7 @@ local CooldownState = {
 local function CreateCooldownOverlay(name, title, id)
     local frame = CreateInstance("Frame", {
         Name = name,
-        Size = UDim2.new(0, 220, 0, 0), -- Height will be auto-calculated or listlayout
+        Size = UDim2.new(0, 280, 0, 0), -- Height will be auto-calculated or listlayout
         AutomaticSize = Enum.AutomaticSize.Y, -- Auto height
         Position = CooldownOverlayPos,
         BackgroundColor3 = Colors.BackgroundSecondary,
@@ -1445,11 +1613,11 @@ local function CreateCooldownOverlay(name, title, id)
     AddUIStroke(frame, Colors.Accent, 1)
     
     local titleLabel = CreateInstance("TextLabel", {
-        Size = UDim2.new(1, 0, 0, 25),
+        Size = UDim2.new(1, 0, 0, 30),
         BackgroundTransparency = 1,
         Text = title,
         TextColor3 = Colors.Accent,
-        TextSize = 12,
+        TextSize = 14,
         Font = Enum.Font.GothamBold,
         Parent = frame
     })
@@ -1457,7 +1625,7 @@ local function CreateCooldownOverlay(name, title, id)
     local listContainer = CreateInstance("Frame", {
         Size = UDim2.new(1, -10, 0, 0), -- Auto size Y
         AutomaticSize = Enum.AutomaticSize.Y,
-        Position = UDim2.new(0, 5, 0, 30),
+        Position = UDim2.new(0, 5, 0, 35),
         BackgroundTransparency = 1,
         Parent = frame
     })
@@ -1511,7 +1679,10 @@ local function CreateCooldownOverlay(name, title, id)
         Frame = frame,
         Container = listContainer,
         TriggerCooldown = function(key, duration)
-             CooldownState[id][key] = os.clock() + duration
+             local currentVal = CooldownState[id][key]
+             if not currentVal or currentVal <= os.clock() then
+                CooldownState[id][key] = os.clock() + duration
+             end
         end,
         Refresh = function(bindings)
             -- 1. Loop through bindings to Update/Create rows
@@ -1528,11 +1699,11 @@ local function CreateCooldownOverlay(name, title, id)
                         local fusedName = GenerateFuseName(skills)
                         row = CreateInstance("TextLabel", {
                             Name = key,
-                            Size = UDim2.new(1, 0, 0, 18),
+                            Size = UDim2.new(1, 0, 0, 22),
                             BackgroundTransparency = 1,
                             Text = "", -- Set later
                             TextColor3 = Colors.Text,
-                            TextSize = 10,
+                            TextSize = 12,
                             Font = Enum.Font.Gotham,
                             TextXAlignment = Enum.TextXAlignment.Left,
                             LayoutOrder = i, -- Strict Order
@@ -1574,10 +1745,10 @@ local function CreateCooldownOverlay(name, title, id)
             end
             
             -- 2. Auto Resize Logic
-            local maxWidth = 220
+            local maxWidth = 280
             for _, child in ipairs(listContainer:GetChildren()) do
                 if child:IsA("TextLabel") then
-                     local bounds = TextService:GetTextSize(child.Text, child.TextSize, child.Font, Vector2.new(1000, 18))
+                     local bounds = TextService:GetTextSize(child.Text, child.TextSize, child.Font, Vector2.new(1000, 22))
                      if bounds.X + 20 > maxWidth then
                          maxWidth = bounds.X + 20
                      end
@@ -1640,55 +1811,23 @@ local KeyCodeMap = {
 UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if gameProcessed then return end
     
+    -- Skip B here because it's handled by InterceptB CAS
+    if BlockDefaultB and input.KeyCode == Enum.KeyCode.B then return end
+
     for key, keyCode in pairs(KeyCodeMap) do
         if input.KeyCode == keyCode then
-            -- Check if holding Innates tool and has skill binding
-            if IsHoldingInnatesTool() then
-                -- Check Fuse Binding first (override)
-                if FuseInnateBindings[key] then
-                    -- Fire all skills and trigger cooldown
-                    task.spawn(function()
-                        for _, skillName in ipairs(FuseInnateBindings[key]) do
-                            FireSkillRemote(skillName)
-                            task.wait(0.05)
-                        end
-                    end)
-                    
-                    -- Trigger Cooldown on Overlay
-                    local maxCD = GetSkillMaxCooldown(FuseInnateBindings[key])
-                    if maxCD > 0 then
-                        InnatesOverlay.TriggerCooldown(key, maxCD)
-                    end
-                    
-                    return
-                elseif RemoteInnateBindings[key] then
-                    FireSkillRemote(RemoteInnateBindings[key])
-                    return
-                end
-            end
-            
-            -- Check if holding Skills tool and has skill binding
-            if IsHoldingSkillsTool() then
-                if FuseSkillBindings[key] then
-                     task.spawn(function()
-                        for _, skillName in ipairs(FuseSkillBindings[key]) do
-                            FireSkillRemote(skillName)
-                            task.wait(0.05)
-                        end
-                     end)
-                     
-                     -- Trigger Cooldown
-                    local maxCD = GetSkillMaxCooldown(FuseSkillBindings[key])
-                    if maxCD > 0 then
-                        SkillsOverlay.TriggerCooldown(key, maxCD)
-                    end
-                    
-                    return
-                elseif RemoteSkillBindings[key] then
-                    FireSkillRemote(RemoteSkillBindings[key])
-                    return
-                end
-            end
+            KeysHeld[key] = true
+            HandleSkillInput(key)
+            break
+        end
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    for key, keyCode in pairs(KeyCodeMap) do
+        if input.KeyCode == keyCode then
+            KeysHeld[key] = false
+            break
         end
     end
 end)
@@ -1843,13 +1982,20 @@ local function RefreshConfigList()
                         end
                     end
                 end
-                -- Load remote skills
                 if config.remoteSkills then
                     for key, skill in pairs(config.remoteSkills) do
                         RemoteSkillBindings[key] = skill
                         if SkillsRemoteRows and SkillsRemoteRows[key] then
                             SkillsRemoteRows[key].Dropdown.SetSelected(skill)
                         end
+                    end
+                end
+                
+                if config.autoChant ~= nil then
+                    AutoChantEnabled = config.autoChant
+                    if _G.AutoChantToggleBtn then
+                        _G.AutoChantToggleBtn.BackgroundColor3 = AutoChantEnabled and Colors.Success or Colors.Danger
+                        _G.AutoChantToggleBtn.Text = "AUTO CHANT: " .. (AutoChantEnabled and "ON" or "OFF")
                     end
                 end
             end
@@ -1974,6 +2120,8 @@ SaveBtn.MouseButton1Click:Connect(function()
             SavedConfigs[configName].fuseSkills[key] = skills
         end
         
+        SavedConfigs[configName].autoChant = AutoChantEnabled
+        
         SaveConfigsToFile()
         RefreshConfigList()
         ConfigNameInput.Text = ""
@@ -2094,6 +2242,8 @@ UpdateBtn.MouseButton1Click:Connect(function()
         for key, skills in pairs(FuseSkillBindings) do
             SavedConfigs[configName].fuseSkills[key] = skills
         end
+        
+        SavedConfigs[configName].autoChant = AutoChantEnabled
         
         SaveConfigsToFile()
         RefreshConfigList()
@@ -2288,8 +2438,51 @@ ClearAutoloadBtn.MouseButton1Click:Connect(function()
     RefreshConfigList()
 end)
 
+-- Auto Chant Section
+local AutoChantFrame = CreateInstance("Frame", {
+    Name = "AutoChantFrame",
+    Size = UDim2.new(1, 0, 0, 50),
+    BackgroundColor3 = Colors.Background,
+    BorderSizePixel = 0,
+    LayoutOrder = 5,
+    Parent = ConfigTab
+})
+AddUICorner(AutoChantFrame, 8)
+
+local AutoChantTitle = CreateInstance("TextLabel", {
+    Size = UDim2.new(0, 150, 1, 0),
+    Position = UDim2.new(0, 15, 0, 0),
+    BackgroundTransparency = 1,
+    Text = "🔄 DOUBLE CHANT (HOOK)",
+    TextColor3 = Colors.Accent,
+    TextSize = 11,
+    Font = Enum.Font.GothamBold,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    Parent = AutoChantFrame
+})
+
+local AutoChantToggleBtn = CreateInstance("TextButton", {
+    Size = UDim2.new(0, 150, 0, 30),
+    Position = UDim2.new(1, -165, 0.5, 0),
+    AnchorPoint = Vector2.new(0, 0.5),
+    BackgroundColor3 = Colors.Danger,
+    Text = "DOUBLE CHANT: OFF",
+    TextColor3 = Colors.Text,
+    TextSize = 11,
+    Font = Enum.Font.GothamBold,
+    Parent = AutoChantFrame
+})
+AddUICorner(AutoChantToggleBtn, 6)
+_G.AutoChantToggleBtn = AutoChantToggleBtn -- Global for config loading accessibility
+
+AutoChantToggleBtn.MouseButton1Click:Connect(function()
+    AutoChantEnabled = not AutoChantEnabled
+    AutoChantToggleBtn.BackgroundColor3 = AutoChantEnabled and Colors.Success or Colors.Danger
+    AutoChantToggleBtn.Text = "DOUBLE CHANT: " .. (AutoChantEnabled and "ON" or "OFF")
+end)
+
 -- Update canvas size for Config tab
-ConfigTab.CanvasSize = UDim2.new(0, 0, 0, 320)
+ConfigTab.CanvasSize = UDim2.new(0, 0, 0, 380)
 
 -- Dragging Functionality
 local dragging = false
@@ -2445,6 +2638,14 @@ if AutoloadConfigName and SavedConfigs[AutoloadConfigName] then
                 end
             end
         end
+
+        if config.autoChant ~= nil then
+            AutoChantEnabled = config.autoChant
+            if _G.AutoChantToggleBtn then
+                _G.AutoChantToggleBtn.BackgroundColor3 = AutoChantEnabled and Colors.Success or Colors.Danger
+                _G.AutoChantToggleBtn.Text = "DOUBLE CHANT: " .. (AutoChantEnabled and "ON" or "OFF")
+            end
+        end
     end)
 end
 
@@ -2477,3 +2678,57 @@ end)
 
 print("⚡ Skill Builder JJI loaded successfully!")
 print("Press '=' to toggle GUI visibility")
+
+-- ============================================
+-- EMOTE SYSTEM (RESTRICTED)
+-- ============================================
+
+-- Redirect Key (Period)
+local RedirectEmoteKey = Enum.KeyCode.Period 
+local BlockDefaultB = true 
+
+-- Function to toggle the emote GUI (Manual Fallback)
+local function ToggleEmoteMenu()
+    local emotesGui = LocalPlayer.PlayerGui:FindFirstChild("Emotes")
+    if emotesGui then
+        local mainFrame = emotesGui:FindFirstChild("Main") or emotesGui:FindFirstChild("Frame") or emotesGui:FindFirstChildOfClass("Frame")
+        if mainFrame then
+            mainFrame.Visible = not mainFrame.Visible
+        end
+    end
+end
+
+-- Intercept logic for the 'B' key
+if BlockDefaultB then
+    local CAS = game:GetService("ContextActionService")
+    CAS:BindActionAtPriority("InterceptB", function(actionName, inputState, inputObject)
+        if inputState == Enum.UserInputState.Begin then
+            KeysHeld["B"] = true
+            local isInnates = _G.IsHoldingInnatesTool and _G.IsHoldingInnatesTool()
+            
+            -- Always attempt to fire script skill
+            if _G.HandleSkillInput then
+                _G.HandleSkillInput("B")
+            end
+            
+            -- Block Emote menu ONLY if holding Innates tool
+            if isInnates then
+                return Enum.ContextActionResult.Sink 
+            else
+                return Enum.ContextActionResult.Pass 
+            end
+        elseif inputState == Enum.UserInputState.End then
+            KeysHeld["B"] = false
+        end
+        -- Consistency for End state
+        local isInnates = _G.IsHoldingInnatesTool and _G.IsHoldingInnatesTool()
+        return isInnates and Enum.ContextActionResult.Sink or Enum.ContextActionResult.Pass
+    end, false, 2000, Enum.KeyCode.B)
+end
+
+-- Fallback emote toggle (Period key)
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if not gameProcessed and input.KeyCode == RedirectEmoteKey then
+        ToggleEmoteMenu()
+    end
+end)
